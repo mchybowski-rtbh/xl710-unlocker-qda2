@@ -1,114 +1,153 @@
 # xl710_unlock
 
-Clears the "qualified module only" bit in the NVM of Intel X710/XL710 NICs, so
-the card will bring up links on SFP+/QSFP+ modules Intel hasn't blessed.
+Clears the "Enable Module Qualification" bit in the NVM of Intel X710/XL710
+NICs, so the card stops refusing SFP+/QSFP+ modules Intel hasn't blessed.
 
-Based on [bibigon812/xl710-unlocker](https://github.com/bibigon812/xl710-unlocker),
-fixed to work correctly on the **XL710-QDA2** (PCI device `0x1583`).
+Derived from [terpstra/xl710-unlocker](https://github.com/terpstra/xl710-unlocker)
+and [bibigon812/xl710-unlocker](https://github.com/bibigon812/xl710-unlocker),
+with the structure-location problem actually solved rather than hardcoded.
 
-## Why the original doesn't work on a QDA2
+## The bit
 
-`i40e` overloads the `ETHTOOL_GEEPROM`/`ETHTOOL_SEEPROM` ioctls into an NVM
-update channel, reinterpreting `struct ethtool_eeprom` as
-`struct i40e_nvm_access`: `magic` becomes `config`, carrying
-`(device_id << 16) | (transaction << 8) | module`.
+Every known card and firmware agrees on one thing: bit 11 of *PHY Capabilities
+Misc0*, at word `+0x08` of each per-port PHY capabilities struct. Clear it on
+every port and the qualification check stops.
 
-The driver's read path only requires `magic` to be non-zero and different from
-the normal ethtool magic, so a **wrong device ID still reads fine**. The write
-path checks `(magic >> 16) != hw->device_id` and returns `-EINVAL`. Upstream
-hardcodes `0x1572` (X710-DA2), so on a QDA2 it prints a completely plausible
-report and then fails at the first write.
+Nothing else is stable. The struct's base offset and its size both move with
+every firmware revision:
 
-Fixed here, along with three other bugs:
+| card / firmware | base | size word | stride | Misc0 |
+|---|---|---|---|---|
+| X710, fw 5.x | `0x6870` | `0x0b` | `0x0c` | `0x2b0c` |
+| X710, fw 6.x | `0x68f0` | `0x0c` | `0x0d` | `0x630c` |
+| X710, fw 8.13 | `0x6940` | `0x0d` | `0x0e` | `0x6b0c` |
+| XL710-QDA2 (`0x1583`) | `0x67fa` | `0x0b` | `0x0c` | `0x0b10` |
+| XL710-QDA2, EETRACK `0x8001037b` | `0x69c4` | `0x0d` | `0x0e` | `0x0310` |
+
+Both upstreams hardcode the stride at `0xc`, so on anything newer than fw 5.x
+they patch words belonging to the *next* struct. That is how people end up with
+a card that reports success and then won't POST.
+
+## How this tool finds the structs
+
+Not by arithmetic. The Shadow RAM pointer chain (`word 0x48` → EMP SR module →
+`+0x19` → PHY capabilities) is only treated as a *hint*; Intel's own HOWTO warns
+the image pointer may be corrupted, and the QDA2 reporter in upstream issue #6
+couldn't resolve it at all.
+
+Instead the section is **recognised** by its signature: word 0 of a struct is its
+payload size, structs sit `size + 1` apart, and that size word therefore repeats
+at exactly that stride. That holds on every dump in the table above. The hint is
+validated against the signature; if it fails, the whole Shadow RAM is scanned for
+something that matches. Nothing is written unless the signature checks out.
+
+This also rejects the classic false positive. Firmware 8.x has the constant
+`0x000b` sitting at struct offset `+07` — exactly what the *size word* was on
+firmware 5.x. Everyone greps for `000b`, lands on `base+7`, reads `+0x08` from
+there, finds bit 11 clear, and concludes the card is already unlocked. Deriving
+the stride *from* the size word kills this: from the false base the implied
+stride predicts a repeat that isn't there.
+
+Other fixes over upstream:
 
 | | upstream | here |
 |---|---|---|
-| device ID | hardcoded `0x1572` | read from sysfs, vendor + driver verified |
-| patch value | writes `misc0`, the value left over from the *last* read, into all four structs | each struct is read-modify-written from its own value |
-| bit flip | `misc ^ 0x0800`, which *re-locks* an already-unlocked struct | explicit set/clear, idempotent |
-| empty structs | written unconditionally | `0x0000`/`0xffff` structs skipped |
-| verification | none | every write is read back and compared; layout is sanity-checked before any write |
+| stride | hardcoded `0xc` | `size + 1`, read from the image |
+| base | pointer chain, unvalidated | recognised by signature, pointer only a hint |
+| device ID | hardcoded `0x1572` | sysfs; vendor and `i40e` driver verified |
+| patch value | writes the value left over from the last read into every struct | each struct read-modify-written from its own value |
+| bit flip | `misc ^ 0x0800`, which re-locks an already-unlocked struct | explicit set/clear, idempotent |
+| verification | none | every write read back and compared |
+| undo | none | `-l` restores the check |
 
 ## Build
 
 ```shell
 make
-make test      # offset/bit selftest, no hardware needed
+make test        # selftest against the real card dumps above; no hardware
 sudo make install
 ```
 
 ## Usage
 
-Report the current state (reads only, safe):
+Report only — reads nothing but the NVM, writes nothing:
 
 ```shell
 # ./xl710_unlock -n enp1s0f0
 enp1s0f0: device 0x1583
-EMP SR offset:        0x67a8
-PHY caps offset:      0x68f6
-PHY struct size:      0x000c words
-  struct 0 @ 0x68fe  MISC 0x6b0c  locked
-  struct 1 @ 0x690b  MISC 0x6b0c  locked
-  struct 2 @ 0x6918  MISC 0x6b0c  locked
-  struct 3 @ 0x6925  MISC 0x6b0c  locked
+EMP SR at 0x6874, pointer chain suggests 0x69c4
+pointer chain validated
+PHY capabilities at 0x69c4: 4 struct(s), size 0x0d, stride 0x0e
+  port 0  struct 0x69c4  Misc0 @ 0x69cc = 0x0b10  locked
+  port 1  struct 0x69d2  Misc0 @ 0x69da = 0x0b10  locked
+  port 2  struct 0x69e0  Misc0 @ 0x69e8 = 0x0b10  locked
+  port 3  struct 0x69ee  Misc0 @ 0x69f6 = 0x0b10  locked
 
 4 of 4 struct(s) locked. Pass -u to unlock.
 ```
 
-Unlock:
+Unlock with `-u`, undo with `-l`. Then **power-cycle at the wall** — the EMP only
+re-reads this section at power-on, so a warm reboot or driver reload won't pick
+it up.
+
+```
+-n <iface>   interface to operate on (required unless -f)
+-f <dump>    analyse a saved image instead of a card, read-only
+-u           unlock: accept unsupported modules
+-l           lock: restore Intel's qualified-module check
+-y           don't ask for confirmation
+-b <base>    force the PHY capabilities base word offset
+-d <word>    dump NVM words starting here, then exit
+-N <count>   words to dump (default 32)
+-i <devid>   override the PCI device ID from sysfs
+-t           run the selftest, then exit
+```
+
+## Diagnosing without touching the card
+
+Save an image and analyse it offline — same recogniser, no write path at all:
 
 ```shell
-# ./xl710_unlock -n enp1s0f0 -u
-...
-About to unlock 4 struct(s) in the NVM of enp1s0f0.
-To undo, run: xl710_unlock -n enp1s0f0 -l
-Continue? [y/N]: y
-  struct 0 @ 0x68fe: 0x6b0c -> 0x630c
-  struct 1 @ 0x690b: 0x6b0c -> 0x630c
-  struct 2 @ 0x6918: 0x6b0c -> 0x630c
-  struct 3 @ 0x6925: 0x6b0c -> 0x630c
-
-4 struct(s) patched, NVM checksum updated.
-Power-cycle the machine (a warm reboot is not enough) for the change to take effect.
+sudo ethtool -e enp1s0f0 raw on > nvm.bin
+./xl710_unlock -f nvm.bin
+./xl710_unlock -f nvm.bin -d 0x69c4 -N 64
 ```
 
-`-l` restores Intel's check. All options:
+A genuine PHY capabilities struct on an XL710 looks like this, with the port
+index in the high byte of the last word — that's the strongest confirmation you
+have the right place:
 
 ```
--n <iface>    interface to operate on (required)
--u            unlock: accept unsupported modules
--l            lock: restore Intel's qualified-module check
--y            don't ask for confirmation
--i <devid>    override the PCI device ID from sysfs
--c <structs>  PHY capability structs to patch (default 4)
--t            run the offset/bit selftest and exit
+  69c4 + 00 => 000d      <- size
+  69c4 + 01 => 0023
+  ...
+  69c4 + 08 => 0b10      <- Misc0, bit 11 set = locked (0x0310 = unlocked)
+  ...
+  69c4 + 0b => 0002      <- port 0; next structs show 0102, 0202, 0302
 ```
+
+## If it says "unlocked" but the card still rejects modules
+
+Check these in order before touching anything:
+
+1. **Power-cycle at the wall.** Not `reboot`, not a driver reload. Pull the cord
+   or switch the PSU off. This is by far the most common cause.
+2. **Confirm the message.** `dmesg | grep -i i40e`. Only
+   *"unsupported SFP module type was detected"* is the qualification check.
+   Anything else is a different problem.
+3. **Confirm the struct.** `-d <base> -N 64` and look for the `0002/0102/0202/0302`
+   port indices. If they're absent, the base is wrong.
+4. **Verify the NVM checksum.** A previous tool that wrote bit 11 without
+   refreshing the checksum leaves an image the EMP may reject wholesale. This
+   tool always refreshes it after a write.
 
 ## Notes
 
-- The NVM is shared by both ports of a QDA2 — patch one interface, not both.
-  Run it again on the second interface and it will report "already unlocked".
-- A **cold power cycle** is required. The EMP only re-reads the PHY
-  capabilities section at power-on; `reboot` or a driver reload won't pick it
-  up.
-- Four PHY capability structs are patched by default because the XL710 NVM
-  carries one per internal PHY lane regardless of how many cages the board
-  has. Structs that read back as empty are skipped. Use `-c` if your image
-  differs.
-- This writes to the card's flash. It is reversible with `-l` and every write
-  is verified, but a NIC whose NVM is half-written is a NIC you may have to
-  recover with Intel's `nvmupdate64e`. The original MISC values are printed
-  before anything is touched — keep them.
-
-## Where the offsets come from
-
-```
-Shadow RAM word 0x48            -> EMP SR settings module pointer
-EMP module + word 0x19          -> PHY capabilities section (relative pointer)
-PHY caps word 0                 -> size of one PHY struct, in words
-PHY caps + 0x08 + (size+1)*n    -> MISC word of struct n
-MISC bit 11 (0x0800)            -> 1 = qualified modules only
-```
-
-Each struct is preceded by its own size word, which is where the `size + 1`
-stride comes from.
+- The NVM is shared by all ports; patch one interface, not each in turn.
+- Four structs are present even on a two-cage QDA2 — one per internal PHY lane.
+  All four are patched.
+- `nvmupdate64e -rd` restores the lock bits. A normal NVM update preserves them.
+- This writes to flash. It is reversible with `-l`, the layout is validated
+  before any write and every write is read back, but a half-written NVM may need
+  recovery with Intel's `nvmupdate64e`. Original values are printed before
+  anything changes — keep them.
