@@ -102,6 +102,40 @@ static uint16_t misc0_set_qual(uint16_t misc, int on)
 	          : (uint16_t)(misc & (uint16_t)~MISC0_MODULE_QUAL);
 }
 
+/* Words +0x02/+0x03 are the 32-bit phy_type bitmap, low word first. Verified
+ * against two independent cards: an X710 decodes to SFI/10GBASE_SR/LR/SFPP_CU/
+ * 1000BASE_SX/LX, an XL710 to XLPPI/40GBASE_CR4_CU/CR4/SR4/LR4. */
+static uint32_t phy_type_of(const uint16_t *nvm, const struct layout *l, int idx)
+{
+	uint16_t b = (uint16_t)(l->base + l->stride * idx);
+	return (uint32_t)nvm[b + 3] << 16 | nvm[b + 2];
+}
+
+static const char *phy_type_name(int bit)
+{
+	static const char *const n[32] = {
+		"SGMII", "1000BASE_KX", "10GBASE_KX4", "10GBASE_KR",
+		"40GBASE_KR4", "XAUI", "XFI", "SFI", "XLAUI", "XLPPI",
+		"40GBASE_CR4_CU", "10GBASE_CR1_CU", "10GBASE_AOC",
+		"40GBASE_AOC", NULL, NULL, NULL, "100BASE_TX", "1000BASE_T",
+		"10GBASE_T", "10GBASE_SR", "10GBASE_LR", "10GBASE_SFPP_CU",
+		"10GBASE_CR1", "40GBASE_CR4", "40GBASE_SR4", "40GBASE_LR4",
+		"1000BASE_SX", "1000BASE_LX", "1000BASE_T_OPTICAL",
+		"20GBASE_KR2", NULL,
+	};
+	return n[bit];
+}
+
+/* Low byte of Misc0 is the link_speed bitmap, same encoding as the admin
+ * queue's I40E_LINK_SPEED_*_SHIFT values. */
+static const char *link_speed_name(int bit)
+{
+	static const char *const n[8] = {
+		NULL, "100M", "1G", "10G", "40G", "20G", "25G", NULL,
+	};
+	return n[bit];
+}
+
 /* Does a PHY capabilities section start at `base`?
  *
  * The size word must repeat at size+1 intervals. That single test rejects the
@@ -216,6 +250,9 @@ static void selftest(void)
 	assert(nvm[misc0_word(&l, 3)] == 0x0b10);
 	assert(scan(nvm, NVM_WORDS, cand, 8) == 1 && cand[0].base == 0x67fa);
 	assert(misc0_set_qual(0x0b10, 0) == 0x0310); /* Yaugen-D's value */
+	/* 40G-only QSFP+ port: XLPPI, 40GBASE_CR4_CU, CR4, SR4, LR4 */
+	assert(phy_type_of(nvm, &l, 0) == 0x07000600);
+	assert((nvm[misc0_word(&l, 0)] & 0xff) == 0x10); /* 40G */
 
 	/* X710 firmware 8.13, terpstra issue #9: base 0x6940, size 0x0d,
 	 * stride 0x0e, Misc0 0x6b0c. Note 0x000b sitting at +07 - the decoy
@@ -232,6 +269,9 @@ static void selftest(void)
 	assert(l.size == 0x0d && l.stride == 0x0e && l.count == 4);
 	assert(nvm[misc0_word(&l, 0)] == 0x6b0c);
 	assert(misc0_set_qual(0x6b0c, 0) == 0x630c);
+	/* SFP+ port: SGMII, 1000BASE_KX, SFI, 10GBASE_SR/LR/SFPP_CU, 1000BASE_SX/LX */
+	assert(phy_type_of(nvm, &l, 0) == 0x18710083);
+	assert((nvm[misc0_word(&l, 0)] & 0xff) == 0x0c); /* 1G + 10G */
 	/* the decoy must not validate */
 	assert(!recognise(nvm, NVM_WORDS, 0x6947, &l));
 	assert(scan(nvm, NVM_WORDS, cand, 8) == 1 && cand[0].base == 0x6940);
@@ -405,6 +445,21 @@ static void show_layout(const uint16_t *nvm, const struct layout *l)
 		       i, (uint16_t)(l->base + l->stride * i), w, nvm[w],
 		       (nvm[w] & MISC0_MODULE_QUAL) ? "locked" : "unlocked");
 	}
+
+	/* What the card will actually accept, independent of qualification.
+	 * A module outside these lists is refused no matter what bit 11 says. */
+	uint32_t pt = phy_type_of(nvm, l, 0);
+	uint16_t speeds = nvm[misc0_word(l, 0)] & 0xff;
+
+	printf("  phy_type 0x%08x:", pt);
+	for (int b = 0; b < 32; b++)
+		if ((pt >> b & 1) && phy_type_name(b))
+			printf(" %s", phy_type_name(b));
+	printf("\n  link_speed 0x%02x:", speeds);
+	for (int b = 0; b < 8; b++)
+		if ((speeds >> b & 1) && link_speed_name(b))
+			printf(" %s", link_speed_name(b));
+	printf("\n");
 }
 
 static void usage(void)
