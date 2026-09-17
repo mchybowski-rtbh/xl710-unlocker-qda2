@@ -152,9 +152,30 @@ firmware is failing to report PHY capabilities at all, which is what happens
 when it cannot determine a PHY type for the module. A card merely declining to
 whitelist a module still knows and reports its own abilities.
 
-Run `ethtool -m <iface>` early. If the card cannot read the module's SFF-8636
-EEPROM, or the module declares a compliance code outside the XL710's
-`40GBASE-CR4/SR4/LR4/AOC/XLPPI`, no NVM bit will help.
+Compare `ethtool <iface>` with the cage **empty** and with the module **in**.
+On one XL710-QDA2 the empty cage reported `40000baseCR4/SR4/LR4` — matching the
+`phy_type` decoded from its NVM — and inserting the DAC emptied the list.
+Inserting a module should never *remove* capabilities, and it pins the
+mechanism: `i40e_update_link_info()` only queries the firmware once
+`MEDIA_AVAILABLE` is set, and on query failure it returns without touching
+`phy_types`, so an empty list means the query **succeeded** and reported
+`phy_type == 0`. The firmware is affirmatively saying no PHY type is usable
+with that module — which is not the same as refusing to whitelist it.
+
+Then read what the module declares: `-m`, or `ethtool -m <iface>`. Only bits
+0-3 of SFF-8636 byte 131 (`XLPPI`, `40GBASE-LR4/SR4/CR4`) have a corresponding
+XL710 `phy_type`; inexpensive DACs often leave that byte `0x00`, which many
+switches ignore and the XL710 does not. No NVM bit changes that.
+
+Note that module EEPROM access may be unavailable entirely. `ethtool -m` uses
+the netlink `MODULE_EEPROM_GET` path, which needs `get_module_eeprom_by_page()`;
+i40e has historically only implemented the legacy
+`get_module_info`/`get_module_eeprom` ioctl ops, so netlink answers EOPNOTSUPP
+and ethtool does not fall back. `-m` here uses the ioctl for that reason — but
+on at least one recent kernel (7.0.0-31, in-tree i40e, FW 9.57) *both* paths
+return EOPNOTSUPP, meaning that build exposes neither. When that happens, read
+the module from the far end of the link: the switch sees the same SFF-8636
+bytes.
 
 ## If it says "unlocked" but the card still rejects modules
 

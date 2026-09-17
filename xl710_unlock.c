@@ -459,6 +459,17 @@ static void show_module(struct nvm *n)
 	uint32_t type = 0, len = 0;
 
 	if (module_info(n, &type, &len)) {
+		if (errno == EOPNOTSUPP)
+			bail("this driver exposes no module EEPROM access.\n"
+			     "  The kernel returns EOPNOTSUPP when ethtool_ops\n"
+			     "  has no .get_module_info, so the legacy ioctl is\n"
+			     "  absent; if `ethtool -m` also failed with a netlink\n"
+			     "  EOPNOTSUPP then .get_module_eeprom_by_page is\n"
+			     "  missing too and neither API is available here.\n"
+			     "  Read the module from the other end of the link\n"
+			     "  instead - the switch sees the same SFF-8636 bytes -\n"
+			     "  or try Intel's out-of-tree i40e, which carries the\n"
+			     "  legacy ops.");
 		if (errno == EINVAL)
 			bail("the driver refused the module EEPROM read (EINVAL).\n"
 			     "  i40e does this in two cases: the firmware lacks\n"
