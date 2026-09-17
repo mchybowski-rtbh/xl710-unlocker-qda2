@@ -398,32 +398,59 @@ The early return in `i40e_force_link_state()` — `is_up && abilities.phy_type
 success; only carrier and speed are. Verify with `ethtool`/`ip link`, not by
 the absence of log spam.
 
-### An unresolved ambiguity about bit 11
+### Bit 11 is not ENABLE_LINK — ruled out
 
-Those bit values raise a question this project cannot yet answer. If Misc0's
-high byte is the same PHY `abilities` byte, then its bits line up exactly —
-0x01/0x02 pause (set in every dump ever seen), 0x08, 0x10, 0x20 — and bit 11
-of the word is `I40E_AQ_PHY_ENABLE_LINK`, **not** module qualification. Under
-that reading every published unlocker, this one included, clears *link enable*.
+Worth recording because it is a tempting wrong turn. The Set PHY Config
+`abilities` byte lines up suspiciously well with Misc0's high byte — `0x01`/
+`0x02` pause (set in every dump anyone has posted), then `0x08 ENABLE_LINK`,
+`0x10 ENABLE_AN`, `0x20 ENABLE_ATOMIC_LINK`. Under that alignment bit 11 of
+Misc0 would be `ENABLE_LINK`, not module qualification, and every unlocker
+including this one would be clearing *link enable*. It looks even more
+plausible once you notice the driver copies `config.abilities` verbatim from
+the firmware and adds `ENABLE_LINK` in only one place, gated on the read-only
+`total-port-shutdown` flag.
 
-Evidence for it: the bit layout matches; `OEMGEN` (`0x0b10`, has 0x08) and
-`OEMGEN_OO` (`0x0310`, lacks it) differ in precisely that bit; and the driver
-never re-adds `ENABLE_LINK` unless `total-port-shutdown` is set in the NVM.
+It is wrong. `i40e_force_link_state()` finishes with:
 
-Evidence against: Intel's own open-optics SKU differs in exactly this bit,
-which only makes sense if it governs qualification, and many X710 users report
-the clear-bit-11 patch working.
+```c
+i40e_aq_set_link_restart_an(hw, is_up, NULL);
+```
 
-A possible reconciliation, untested: 10G SFI needs no Clause 73
-auto-negotiation, so clearing the bit is survivable on an X710 SFP+ port, while
-40GBASE-CR4 copper requires link training and fails. The one reported XL710
-success was with a BiDi *optical* module, not a DAC.
+and that is a **different** admin-queue command (`set_link_restart_an`) which
+sets `I40E_AQ_PHY_LINK_ENABLE (0x04)` in its own command byte whenever
+`enable_link` is true:
 
-Cheap, reversible tests, in order: `ethtool -s <iface> autoneg on`; then `-l`
-on a card that has never been tried with bit 11 **set**; then issuing Set PHY
-Config by hand through i40e's debugfs `send aq_cmd`. Until one of those
-resolves it, treat bit 11's meaning as confirmed only by Intel's image pair,
-not by first principles.
+```c
+cmd->command = I40E_AQ_PHY_RESTART_AN;
+if (enable_link)
+        cmd->command |= I40E_AQ_PHY_LINK_ENABLE;
+```
+
+So link enable is asserted explicitly on every interface up, independent of
+the `abilities` byte. A missing `0x08` in the NVM cannot be what keeps a port
+down. Combined with Intel shipping `OEMGEN` and `OEMGEN_OO` differing in
+exactly bit 11, the qualification reading stands.
+
+### When the software avenues are exhausted
+
+On the XL710-QDA2 traced through this README, every software lever was
+verified spent:
+
+- NVM: genuine Intel open-optics build, bit 11 clear, `phy_type` includes
+  `40GBASE_CR4`, `link_speed` 40G, checksum valid, struct identical to Intel's
+  image
+- module: declares `40GBASE-CR4` (read from the link partner)
+- driver: `i40e_open()` forces all PHY types including `UNRECOGNIZED` and
+  `UNSUPPORTED`, sets 40G, and restarts AN with link enable
+- `link-down-on-close on`, so the link-event handler no longer clobbers that
+- no module parameter, priv flag, or AQ bit exists that disables qualification
+
+The firmware still reported `phy_type == 0` and never trained. At that point
+the remaining explanations are physical — the cable, the cage, or the board —
+and the next test is not another bit but a different peer: connect the port to
+a **switch** rather than looping it back to the card's own other port. Two
+ports of one card driven by one EMP is not a configuration any of this was
+validated against, and a fault there is not evidence about the cable.
 
 ## Notes
 
