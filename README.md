@@ -202,10 +202,46 @@ against a block's `REPLACES` list, and a card already at `8001037B` is the
 locked build's own `EEPID`, so the tool considers it up to date and will not
 cross over to the OO lineage. The two `nvmupdate.cfg` blocks are otherwise
 identical — same `VENDOR: 8086`, `DEVICE: 1583`, same `EEPROM MAP`, same OROM —
-so adding the current EETRACK to the OO block's `REPLACES` in a copy of the
-config lets Intel's own tool do the write, with its own checksums and MAC
-preservation. Back the card up first (`nvmupdate64e -b`), and keep the locked
-image to go back.
+so routing the card to the OO block lets Intel's own tool do the write, with
+its own checksums and MAC preservation.
+
+Two edits are needed, not one — adding the EETRACK to `REPLACES` still leaves
+the locked block declaring that same EETRACK as its `EEPID`, which is what
+makes `nvmupdate` answer "up to date". `nvmupdate-cfg-patch.py` makes both and
+verifies the result:
+
+```shell
+./nvmupdate-cfg-patch.py /path/to/nvmupdate.cfg \
+    --eetrack 8001037B --device 1583 \
+    --image XL710QDA2_9p57_CFGID4p5_OEMGEN_OO.bin
+```
+
+```
+before:
+  already-current  XL710QDA2_9p57_CFGID4p5_OEMGEN.bin (EEPID 8001037B)
+edit 1: added 8001037B to REPLACES of XL710QDA2_9p57_CFGID4p5_OEMGEN_OO.bin
+edit 2: commented out XL710QDA2_9p57_CFGID4p5_OEMGEN.bin
+after:
+  updates          XL710QDA2_9p57_CFGID4p5_OEMGEN_OO.bin (EEPID 80010385)
+```
+
+It keeps the file CRLF, keeps `BEGIN`/`END DEVICE` balanced, and refuses to
+write unless exactly one block would update the card and none still claims that
+EETRACK as its own `EEPID` — all three are easy to get wrong by hand in a file
+that drives a firmware write. `-n` dry-runs it; the original is saved as
+`.orig`. Then:
+
+```shell
+sudo ./nvmupdate64e            # from the directory with the patched cfg
+# cold power cycle, then confirm:
+sudo ./xl710_unlock -n <iface> -c XL710QDA2_9p57_CFGID4p5_OEMGEN_OO.bin
+#   want: EETRACK 0x80010385 and "structs are identical"
+```
+
+Back the card up first (see `nvmupdate64e -h`) and keep the locked image so you
+can go back. Note this retargets only the given EETRACK: a QDA2 at some *other*
+version that the locked block would have updated will now report no update,
+since those ids stay in the disabled block.
 
 ## Notes
 
