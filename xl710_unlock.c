@@ -28,6 +28,7 @@
  */
 
 #include <assert.h>
+#include <errno.h>
 #include <getopt.h>
 #include <net/if.h>
 #include <stdarg.h>
@@ -39,6 +40,21 @@
 #include <sys/socket.h>
 #include <unistd.h>
 #include <linux/sockios.h>
+
+/* Module EEPROM, via the legacy ioctl ops. ethtool's `-m` now goes through
+ * netlink MODULE_EEPROM_GET, which needs get_module_eeprom_by_page(); i40e
+ * only implements the older get_module_info/get_module_eeprom, so netlink
+ * answers EOPNOTSUPP and ethtool does not fall back. The ioctl still works. */
+#define ETHTOOL_GMODULEINFO   0x42
+#define ETHTOOL_GMODULEEEPROM 0x43
+#define ETH_MODULE_SFF_8079   0x1
+#define ETH_MODULE_SFF_8472   0x2
+#define ETH_MODULE_SFF_8436   0x3
+#define ETH_MODULE_SFF_8636   0x4
+
+/* SFF-8636 byte 131, "10/40G Ethernet Compliance Codes". Bits 0-3 are the
+ * only ones an XL710 can select a phy_type for. */
+#define QSFP_COMPLIANCE_XL710 0x0f
 
 /* i40e NVM access, as the driver reinterprets struct ethtool_eeprom */
 #define I40E_NVM_READ         0x0b
@@ -134,6 +150,16 @@ static const char *link_speed_name(int bit)
 {
 	static const char *const n[8] = {
 		NULL, "100M", "1G", "10G", "40G", "20G", "25G", NULL,
+	};
+	return n[bit];
+}
+
+static const char *qsfp_compliance_name(int bit)
+{
+	static const char *const n[8] = {
+		"40G Active Cable (XLPPI)", "40GBASE-LR4", "40GBASE-SR4",
+		"40GBASE-CR4", "10GBASE-SR", "10GBASE-LR", "10GBASE-LRM",
+		"extended (see byte 192)",
 	};
 	return n[bit];
 }
@@ -305,6 +331,14 @@ static void selftest(void)
 	assert(misc0_set_qual(0x630c, 1) == 0x6b0c);
 	assert(misc0_set_qual(0x6b0c, 1) == 0x6b0c);
 
+	/* SFF-8636 byte 131: a 40G DAC declares 40GBASE-CR4 (bit 3). */
+	assert(QSFP_COMPLIANCE_XL710 & (1 << 3));
+	assert(!(QSFP_COMPLIANCE_XL710 & (1 << 4)));  /* 10GBASE-SR: no */
+	assert(!(0x00 & QSFP_COMPLIANCE_XL710));      /* nothing declared */
+	assert(!(0x80 & QSFP_COMPLIANCE_XL710));      /* extended-only */
+	assert(0x08 & QSFP_COMPLIANCE_XL710);         /* CR4 only */
+	assert(!strcmp(qsfp_compliance_name(3), "40GBASE-CR4"));
+
 	printf("selftest: ok\n");
 }
 
@@ -355,6 +389,146 @@ static void nvm_slurp(struct nvm *n, uint16_t *buf, size_t nwords)
 		if (nvm_op(n, I40E_NVM_READ, I40E_NVM_SA,
 		           (uint32_t)(w << 1), (uint32_t)(chunk << 1), &buf[w]))
 			die("NVM read");
+	}
+}
+
+/* ---- module EEPROM ---- */
+
+static const char *module_type_name(uint32_t t)
+{
+	switch (t) {
+	case ETH_MODULE_SFF_8079: return "SFF-8079 (SFP)";
+	case ETH_MODULE_SFF_8472: return "SFF-8472 (SFP+ with DOM)";
+	case ETH_MODULE_SFF_8436: return "SFF-8436 (QSFP+)";
+	case ETH_MODULE_SFF_8636: return "SFF-8636 (QSFP+/QSFP28)";
+	default:                  return "unknown";
+	}
+}
+
+static int module_info(struct nvm *n, uint32_t *type, uint32_t *len)
+{
+	struct {
+		uint32_t cmd, type, eeprom_len, reserved[8];
+	} mi = { .cmd = ETHTOOL_GMODULEINFO };
+	struct ifreq ifr;
+
+	memset(&ifr, 0, sizeof ifr);
+	snprintf(ifr.ifr_name, IFNAMSIZ, "%s", n->ifname);
+	ifr.ifr_data = (void *)&mi;
+	if (ioctl(n->fd, SIOCETHTOOL, &ifr) == -1)
+		return -1;
+	*type = mi.type;
+	*len = mi.eeprom_len;
+	return 0;
+}
+
+static int module_eeprom(struct nvm *n, uint32_t off, uint32_t len, uint8_t *out)
+{
+	struct {
+		uint32_t cmd, magic, offset, len;
+		uint8_t data[256];
+	} req = { .cmd = ETHTOOL_GMODULEEEPROM, .offset = off, .len = len };
+	struct ifreq ifr;
+
+	if (len > sizeof req.data)
+		return -1;
+	memset(&ifr, 0, sizeof ifr);
+	snprintf(ifr.ifr_name, IFNAMSIZ, "%s", n->ifname);
+	ifr.ifr_data = (void *)&req;
+	if (ioctl(n->fd, SIOCETHTOOL, &ifr) == -1)
+		return -1;
+	memcpy(out, req.data, len);
+	return 0;
+}
+
+static void show_ascii(const char *label, const uint8_t *d, int len)
+{
+	int end = len;
+
+	while (end > 0 && (d[end - 1] == ' ' || d[end - 1] == '\0'))
+		end--;
+	printf("  %-18s '", label);
+	for (int i = 0; i < end; i++)
+		putchar(d[i] >= 0x20 && d[i] < 0x7f ? d[i] : '.');
+	printf("'\n");
+}
+
+static void show_module(struct nvm *n)
+{
+	uint8_t d[256] = { 0 };
+	uint32_t type = 0, len = 0;
+
+	if (module_info(n, &type, &len)) {
+		if (errno == EINVAL)
+			bail("the driver refused the module EEPROM read (EINVAL).\n"
+			     "  i40e does this in two cases: the firmware lacks\n"
+			     "  AQ_PHY_ACCESS_CAPABLE, or phy_type is EMPTY - it\n"
+			     "  cannot identify the inserted module at all. Check\n"
+			     "  dmesg: \"Cannot read module EEPROM memory. No module\n"
+			     "  connected.\" is the second case, and confirms the\n"
+			     "  firmware has no usable PHY type for this module.");
+		die("ETHTOOL_GMODULEINFO");
+	}
+	printf("module: type %u = %s, eeprom_len %u\n",
+	       type, module_type_name(type), len);
+
+	if (len > sizeof d)
+		len = sizeof d;
+	if (module_eeprom(n, 0, len, d))
+		die("ETHTOOL_GMODULEEEPROM");
+
+	for (uint32_t i = 0; i < len; i += 16) {
+		printf("  %02x:", i);
+		for (uint32_t j = 0; j < 16 && i + j < len; j++)
+			printf(" %02x", d[i + j]);
+		printf("\n");
+	}
+
+	if (type != ETH_MODULE_SFF_8436 && type != ETH_MODULE_SFF_8636) {
+		printf("  (not a QSFP module; fields below are QSFP-only)\n");
+		return;
+	}
+	if (len < 256) {
+		printf("  only %u bytes readable, need 256 for the upper page\n",
+		       len);
+		return;
+	}
+
+	uint8_t comp = d[131], ext = d[192];
+
+	printf("\n  identifier        0x%02x%s\n", d[128],
+	       d[128] == 0x0d ? " (QSFP+)" :
+	       d[128] == 0x11 ? " (QSFP28)" : "");
+	printf("  connector         0x%02x%s\n", d[130],
+	       d[130] == 0x23 ? " (no separable connector - DAC/AOC)" : "");
+	show_ascii("vendor", d + 148, 16);
+	printf("  vendor OUI        %02x:%02x:%02x\n", d[165], d[166], d[167]);
+	show_ascii("part number", d + 168, 16);
+	show_ascii("revision", d + 184, 2);
+	show_ascii("serial", d + 196, 16);
+
+	printf("\n  byte 131 Ethernet compliance = 0x%02x:", comp);
+	if (!comp)
+		printf(" NOTHING DECLARED");
+	for (int b = 0; b < 8; b++)
+		if (comp >> b & 1)
+			printf("\n      bit %d  %s", b, qsfp_compliance_name(b));
+	printf("\n");
+	if (comp & 0x80)
+		printf("  byte 192 extended compliance = 0x%02x\n", ext);
+
+	if (comp & QSFP_COMPLIANCE_XL710) {
+		printf("\n  -> declares a type the XL710 supports. If the link is "
+		       "still down the module\n     is not the reason.\n");
+	} else {
+		printf("\n  -> declares NOTHING in the XL710's phy_type set "
+		       "(40G CR4/SR4/LR4/XLPPI).\n"
+		       "     The firmware has no PHY type to select for this "
+		       "module, which is why it\n"
+		       "     reports no PHY capabilities and never brings the "
+		       "link up. No NVM bit\n"
+		       "     changes this - the module itself has to declare a "
+		       "supported type.\n");
 	}
 }
 
@@ -548,6 +722,8 @@ static void usage(void)
 	    "  -l           lock: restore Intel's qualified-module check\n"
 	    "  -y           don't ask for confirmation\n"
 	    "  -b <base>    force the PHY capabilities base word offset\n"
+    "  -m           dump and decode the module's EEPROM, then exit. Use this\n"
+	    "               when `ethtool -m` fails with a netlink EOPNOTSUPP\n"
 	    "  -d <word>    dump NVM words starting here, then exit\n"
 	    "  -N <count>   words to dump (default 32)\n"
 	    "  -i <devid>   override the PCI device ID from sysfs\n"
@@ -562,10 +738,10 @@ int main(int argc, char *const *argv)
 	const char *ifname = NULL, *fromfile = NULL, *reffile = NULL;
 	uint32_t devid = 0;
 	long force_base = -1, dump_at = -1, dump_n = 32;
-	int want_lock = -1, assume_yes = 0, c;
+	int want_lock = -1, assume_yes = 0, show_mod = 0, c;
 	size_t nwords = NVM_WORDS;
 
-	while ((c = getopt(argc, argv, "n:i:b:d:N:f:c:ulyth?")) != -1) {
+	while ((c = getopt(argc, argv, "n:i:b:d:N:f:c:mulyth?")) != -1) {
 		switch (c) {
 		case 'n': ifname = optarg; break;
 		case 'f': fromfile = optarg; break;
@@ -577,6 +753,7 @@ int main(int argc, char *const *argv)
 		case 'u': want_lock = 0; break;
 		case 'l': want_lock = 1; break;
 		case 'y': assume_yes = 1; break;
+		case 'm': show_mod = 1; break;
 		case 't': selftest(); return 0;
 		default:  usage();
 		}
@@ -620,6 +797,12 @@ int main(int argc, char *const *argv)
 		die("socket");
 
 	printf("%s: device 0x%04x\n", ifname, devid);
+
+	if (show_mod) {
+		show_module(&nvm);
+		return 0;
+	}
+
 	nvm_slurp(&nvm, sr, NVM_WORDS);
 
 analyse:
