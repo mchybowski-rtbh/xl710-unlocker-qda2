@@ -301,6 +301,69 @@ can go back. Note this retargets only the given EETRACK: a QDA2 at some *other*
 version that the locked block would have updated will now report no update,
 since those ids stay in the disabled block.
 
+## Driver-level workarounds: what actually exists in i40e
+
+Read from mainline `drivers/net/ethernet/intel/i40e/`:
+
+**The driver never disables anything.** The qualification message is a bare
+`dev_err()` in `i40e_handle_link_event()` with no side effect. All enforcement
+is in the EMP firmware.
+
+**There is no qualification override at runtime.** `i40e` has exactly one
+module parameter, `debug`. No priv flag touches qualification. And the
+`abilities` byte of the Set PHY Config admin-queue command has no
+module-qualification bit at all — only `PAUSE_TX 0x01`, `PAUSE_RX 0x02`,
+`ENABLE_LINK 0x08`, `ENABLE_AN 0x10`, `ENABLE_ATOMIC_LINK 0x20`.
+`I40E_AQ_QUALIFIED_MODULE 0x80` exists solely as a read-only status bit in
+`an_info`. So there is no `allow_unsupported_sfp` equivalent to add — nothing
+for it to write.
+
+**The strongest override already runs automatically.** `i40e_open()` calls
+`i40e_force_link_state(pf, true)` unconditionally, which issues Set PHY Config
+with `config.phy_type = I40E_PHY_TYPES_BITMASK` — a mask that explicitly
+includes `I40E_PHY_TYPE_UNRECOGNIZED` (0xE) and `I40E_PHY_TYPE_UNSUPPORTED`
+(0xF) — then restarts auto-negotiation. It skips this only when the firmware
+already reports a non-zero `phy_type` *and* non-zero `link_speed`; a card
+reporting `phy_type == 0` with a module inserted therefore always gets the
+forced mask. If a card still will not link after that, the driver has already
+done everything a workaround could do.
+
+**Two bits the driver will not set for you.** `config.abilities` is copied
+verbatim from what the firmware reports, so anything absent there stays absent:
+
+- `ENABLE_LINK 0x08` is added in exactly one place, `i40e_force_link_state()`,
+  and only under `I40E_FLAG_TOTAL_PORT_SHUTDOWN_ENA` — a **read-only** priv
+  flag sourced from the NVM, so it cannot be turned on from userspace.
+- `ENABLE_AN 0x10` is added by `i40e_set_link_ksettings()` when autoneg is
+  enabled, which makes `ethtool -s <iface> autoneg on` a genuine lever.
+
+### An unresolved ambiguity about bit 11
+
+Those bit values raise a question this project cannot yet answer. If Misc0's
+high byte is the same PHY `abilities` byte, then its bits line up exactly —
+0x01/0x02 pause (set in every dump ever seen), 0x08, 0x10, 0x20 — and bit 11
+of the word is `I40E_AQ_PHY_ENABLE_LINK`, **not** module qualification. Under
+that reading every published unlocker, this one included, clears *link enable*.
+
+Evidence for it: the bit layout matches; `OEMGEN` (`0x0b10`, has 0x08) and
+`OEMGEN_OO` (`0x0310`, lacks it) differ in precisely that bit; and the driver
+never re-adds `ENABLE_LINK` unless `total-port-shutdown` is set in the NVM.
+
+Evidence against: Intel's own open-optics SKU differs in exactly this bit,
+which only makes sense if it governs qualification, and many X710 users report
+the clear-bit-11 patch working.
+
+A possible reconciliation, untested: 10G SFI needs no Clause 73
+auto-negotiation, so clearing the bit is survivable on an X710 SFP+ port, while
+40GBASE-CR4 copper requires link training and fails. The one reported XL710
+success was with a BiDi *optical* module, not a DAC.
+
+Cheap, reversible tests, in order: `ethtool -s <iface> autoneg on`; then `-l`
+on a card that has never been tried with bit 11 **set**; then issuing Set PHY
+Config by hand through i40e's debugfs `send aq_cmd`. Until one of those
+resolves it, treat bit 11's meaning as confirmed only by Intel's image pair,
+not by first principles.
+
 ## Notes
 
 - The NVM is shared by all ports; patch one interface, not each in turn.
