@@ -49,6 +49,8 @@
 #define I40E_NVM_SA           (I40E_NVM_SNT | I40E_NVM_LCB)
 #define I40E_NVM_CSUM         0x8
 
+#define SR_NVM_EETRACK_LO     0x2d   /* EETRACK id, identifies the NVM build */
+#define SR_NVM_EETRACK_HI     0x2e
 #define SR_EMP_MODULE_PTR     0x48   /* Shadow RAM -> EMP SR settings module */
 #define EMP_PHY_CAPS_PTR      0x19   /* EMP + this -> PHY caps, relative     */
 #define PHY_MISC0             0x08   /* Misc0 word within a PHY caps struct  */
@@ -379,6 +381,23 @@ static void update_checksum(struct nvm *n)
 
 /* ---- device identification ---- */
 
+/* Read the first NVM_WORDS words of an NVM image. Intel's update .bin files
+ * are the whole 4MB flash; only the leading shadow RAM concerns us. */
+static size_t load_image(const char *path, uint16_t *buf)
+{
+	FILE *f = fopen(path, "rb");
+	size_t got;
+
+	if (!f)
+		die(path);
+	got = fread(buf, sizeof *buf, NVM_WORDS, f);
+	fclose(f);
+	if (got < 0x100)
+		bail("%s: only %zu words, too short to be an NVM image",
+		     path, got);
+	return got;
+}
+
 static unsigned long sysfs_hex(const char *ifname, const char *attr)
 {
 	char path[256], buf[64];
@@ -433,8 +452,56 @@ static void dump(const uint16_t *nvm, uint16_t at, int count)
 		printf("  %04x + %02x => %04x\n", at, i, nvm[at + i]);
 }
 
+static uint32_t eetrack_of(const uint16_t *nvm)
+{
+	return (uint32_t)nvm[SR_NVM_EETRACK_HI] << 16 | nvm[SR_NVM_EETRACK_LO];
+}
+
+/* Diff this card's PHY capabilities against a reference NVM image, e.g. one of
+ * the .bin files in Intel's NVM update package. A card whose struct does not
+ * match any shipped image is in a state no firmware expects, which is a more
+ * likely explanation for odd behaviour than a wrong offset. */
+static void compare(const uint16_t *card, const struct layout *cl,
+                    const uint16_t *ref, size_t rn, const char *name)
+{
+	struct layout rl;
+	int diffs = 0;
+
+	printf("\nvs %s:\n", name);
+	printf("  EETRACK   card 0x%08x   image 0x%08x%s\n",
+	       eetrack_of(card), eetrack_of(ref),
+	       eetrack_of(card) == eetrack_of(ref) ? "   (same build)" : "");
+
+	if (!recognise(ref, rn, cl->base, &rl)) {
+		printf("  no PHY capabilities at 0x%04x in the image; "
+		       "layouts differ, not comparing structs\n", cl->base);
+		return;
+	}
+	if (rl.size != cl->size || rl.stride != cl->stride) {
+		printf("  layout differs (image size 0x%02x stride 0x%02x); "
+		       "not comparing structs\n", rl.size, rl.stride);
+		return;
+	}
+
+	for (int p = 0; p < cl->count && p < rl.count; p++) {
+		uint16_t cb = (uint16_t)(cl->base + cl->stride * p);
+		uint16_t rb = (uint16_t)(rl.base + rl.stride * p);
+
+		for (int i = 0; i < cl->stride; i++)
+			if (card[cb + i] != ref[rb + i]) {
+				printf("  port %d +%02x: card %04x  image %04x%s\n",
+				       p, i, card[cb + i], ref[rb + i],
+				       i == PHY_MISC0 ? "   <- Misc0" : "");
+				diffs++;
+			}
+	}
+	if (!diffs)
+		printf("  PHY capabilities structs are identical\n");
+}
+
 static void show_layout(const uint16_t *nvm, const struct layout *l)
 {
+	printf("EETRACK 0x%08x\n", eetrack_of(nvm));
 	printf("PHY capabilities at 0x%04x: %d struct(s), "
 	       "size 0x%02x, stride 0x%02x\n",
 	       l->base, l->count, l->size, l->stride);
@@ -475,6 +542,8 @@ static void usage(void)
 	    "  -n <iface>   interface to operate on (required unless -f)\n"
 	    "  -f <dump>    analyse a saved image instead of a card, read-only.\n"
 	    "               Make one with: ethtool -e <iface> raw on > nvm.bin\n"
+	    "  -c <image>   also diff against a reference NVM image, e.g. a .bin\n"
+	    "               from Intel's NVM update package\n"
 	    "  -u           unlock: accept unsupported modules\n"
 	    "  -l           lock: restore Intel's qualified-module check\n"
 	    "  -y           don't ask for confirmation\n"
@@ -490,16 +559,17 @@ static void usage(void)
 
 int main(int argc, char *const *argv)
 {
-	const char *ifname = NULL, *fromfile = NULL;
+	const char *ifname = NULL, *fromfile = NULL, *reffile = NULL;
 	uint32_t devid = 0;
 	long force_base = -1, dump_at = -1, dump_n = 32;
 	int want_lock = -1, assume_yes = 0, c;
 	size_t nwords = NVM_WORDS;
 
-	while ((c = getopt(argc, argv, "n:i:b:d:N:f:ulyth?")) != -1) {
+	while ((c = getopt(argc, argv, "n:i:b:d:N:f:c:ulyth?")) != -1) {
 		switch (c) {
 		case 'n': ifname = optarg; break;
 		case 'f': fromfile = optarg; break;
+		case 'c': reffile = optarg; break;
 		case 'i': devid = strtoul(optarg, NULL, 0); break;
 		case 'b': force_base = strtol(optarg, NULL, 0); break;
 		case 'd': dump_at = strtol(optarg, NULL, 0); break;
@@ -519,23 +589,11 @@ int main(int argc, char *const *argv)
 	struct nvm nvm = { 0 };
 
 	if (fromfile) {
-		FILE *f;
-		size_t got;
-
 		if (want_lock >= 0)
 			bail("-f analyses a saved image; it cannot write. "
 			     "Drop -u/-l and run against the card.");
-
-		f = fopen(fromfile, "rb");
-		if (!f)
-			die(fromfile);
-		got = fread(sr, sizeof *sr, NVM_WORDS, f);
-		fclose(f);
-		if (got < 0x100)
-			bail("%s: only %zu words, too short to be an NVM image",
-			     fromfile, got);
-		nwords = got;
-		printf("%s: %zu words (0x%zx)\n", fromfile, got, got);
+		nwords = load_image(fromfile, sr);
+		printf("%s: %zu words (0x%zx)\n", fromfile, nwords, nwords);
 		goto analyse;
 	}
 
@@ -624,6 +682,12 @@ analyse:
 	}
 
 	show_layout(sr, &l);
+
+	if (reffile) {
+		static uint16_t ref[NVM_WORDS];
+		size_t rn = load_image(reffile, ref);
+		compare(sr, &l, ref, rn, reffile);
+	}
 
 	int locked = 0;
 	for (int i = 0; i < l.count; i++)

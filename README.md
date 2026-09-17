@@ -93,6 +93,7 @@ it up.
 ```
 -n <iface>   interface to operate on (required unless -f)
 -f <dump>    analyse a saved image instead of a card, read-only
+-c <image>   also diff against a reference NVM image (an Intel .bin)
 -u           unlock: accept unsupported modules
 -l           lock: restore Intel's qualified-module check
 -y           don't ask for confirmation
@@ -140,48 +141,71 @@ Check these in order before touching anything:
 4. **Verify the NVM checksum.** A previous tool that wrote bit 11 without
    refreshing the checksum leaves an image the EMP may reject wholesale. This
    tool always refreshes it after a write.
+5. **Diff against the image Intel ships for your card.** `-c <image>` against
+   the `.bin` files in the NVM update package. If your EETRACK is the `EEPID`
+   of a *locked* build but bit 11 is clear, the card has been hand-patched into
+   a state no firmware ships — see the firmware 9.x section below, where
+   clearing bit 11 is not sufficient.
 
-## Known limitation: firmware 9.57 on XL710-QDA2
+## Firmware 9.x: bit 11 alone is not enough
 
-On at least one XL710-QDA2 (`0x1583`, firmware **9.57**, EETRACK `0x8001037b`)
-this method does not work, because there is nothing left to patch:
+On firmware 9.x, "open optics" is a **separate NVM build**, not a bit you flip.
+Intel's own update package proves it. For the same firmware version 9.57 it
+ships three XL710-QDA2 images:
+
+| image | EEPID | Misc0 | |
+|---|---|---|---|
+| `XL710QDA2_9p57_CFGID4p5_OEMGEN.bin` | `8001037B` | `0x0b10` | locked |
+| `XL710QDA2_9p57_CFGID4p5_OEMGEN_OO.bin` | `80010385` | `0x0310` | unlocked |
+| `XL710QDA2_9p57_CFGID4p5_K15190.bin` | `8001035A` | `0x0310` | unlocked |
+
+So bit 11 is still meaningful on 9.x — but it is not the only difference. The
+two unlocked builds differ from the locked one by ~1870 words *outside* the
+64 KB Shadow RAM, while differing from **each other** by only 18. That shared
+content is the open-optics part, and no amount of patching the Shadow RAM
+produces it. Among other things the unlocked builds carry extra port-config
+entries (`1x40 LOM`, `2x40 LOM`, `4x10LOM`, `2x2x10LOM`) that the locked build
+lacks; the rest of the config table is identical, so nothing is lost by moving
+to them.
+
+There is also a header word that tracks the firmware era. Word `+0x01` of each
+PHY capabilities struct reads `0x0223` in every 9.x image and `0x0222` on X710
+fw 8.13, but `0x0023`/`0x0022` on 4.42-era and fw 6.x images.
+
+### A card patched by hand ends up in a state no build ships
+
+One XL710-QDA2 (FW 9.57) showed exactly this. `-c` against Intel's images:
 
 ```
-PHY capabilities at 0x69c4: 4 struct(s), size 0x0d, stride 0x0e
-  port 0..3  Misc0 = 0x0310   <- bit 11 already CLEAR from the factory
-  phy_type 0x07000600: XLPPI 40GBASE_CR4_CU 40GBASE_CR4 40GBASE_SR4 40GBASE_LR4
-  link_speed 0x10: 40G
+EETRACK 0x8001037b                       <- the LOCKED OEMGEN build
+  port 0..3  Misc0 = 0x0310              <- but bit 11 clear, like OO
+vs XL710QDA2_9p57_CFGID4p5_OEMGEN_OO.bin:
+  EETRACK   card 0x8001037b   image 0x80010385
+  port 0 +01: card 0023  image 0223      <- pre-8.x header word
+  ...
 ```
 
-The card nevertheless refuses a third-party 40G QSFP+ DAC with the
-qualification message, and `ethtool` reports `Supported link modes: Not
-reported` (i.e. `i40e_aq_get_phy_abilities()` returned nothing, so the EMP is
-shutting the PHY down rather than the driver refusing it).
+The card runs the locked build, with bit 11 cleared and a stale `+0x01`. It
+matches no shipped image, and the firmware refuses third-party optics anyway:
+`Rx/Tx is disabled ... unsupported SFP module type was detected`, with
+`ethtool` reporting `Supported link modes: Not reported` (i.e.
+`i40e_aq_get_phy_abilities()` returned nothing, so the EMP is holding the PHY
+down rather than the driver declining the module).
 
-What was checked on that image, all negative:
+Its NVM checksum validated and `phy_type` already permitted `40GBASE_CR4`, so
+the module was not being refused on type or speed. Clearing bit 11 — all this
+tool or any other can do — was already done and had not helped.
 
-- the section is certain — the EMP pointer table at `emp+0x19..0x1c` holds four
-  per-port pointers landing exactly on the four structs
-- NVM checksum validates (computed `0xb415` == stored), so it is not a
-  half-applied patch the EMP is ignoring
-- `phy_type` already permits `40GBASE_CR4`, so the module is not being refused
-  on PHY type or speed
-- no second qualification-shaped word anywhere in the 64 KB Shadow RAM: no
-  other section matching the repeating-size signature, and no value with bit 11
-  set repeating at any stride 4..64 in `0x6000-0x7800`
-- no qualified-module list in the Shadow RAM (only VPD strings), so it lives in
-  the EMP blob outside this window
-
-Conclusion: on that firmware the enforcement is not reachable from the Shadow
-RAM PHY capabilities section, and clearing bit 11 — which every tool including
-this one does — is a no-op because it is already clear. Reports of success on
-firmware 9.3 and 9.10 are on cards where bit 11 was still *set*.
-
-If you are in this position, the options that don't involve guessing at flash
-writes are: recode the module's own EEPROM to an Intel-qualified vendor OUI and
-part number (upstream issue #6 is an XL710-QDA2 resolved exactly this way, with
-no card changes), use an Intel-coded module, or downgrade the firmware to a
-revision where bit 11 is set and honoured.
+**The fix in that situation is to flash Intel's open-optics build, not to patch
+bits.** `nvmupdate64e` selects an image by matching the card's current EETRACK
+against a block's `REPLACES` list, and a card already at `8001037B` is the
+locked build's own `EEPID`, so the tool considers it up to date and will not
+cross over to the OO lineage. The two `nvmupdate.cfg` blocks are otherwise
+identical — same `VENDOR: 8086`, `DEVICE: 1583`, same `EEPROM MAP`, same OROM —
+so adding the current EETRACK to the OO block's `REPLACES` in a copy of the
+config lets Intel's own tool do the write, with its own checksums and MAC
+preservation. Back the card up first (`nvmupdate64e -b`), and keep the locked
+image to go back.
 
 ## Notes
 
