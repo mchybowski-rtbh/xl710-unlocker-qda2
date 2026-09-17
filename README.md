@@ -127,6 +127,35 @@ have the right place:
   69c4 + 0b => 0002      <- port 0; next structs show 0102, 0202, 0302
 ```
 
+## The dmesg message is weaker evidence than it looks
+
+Before chasing the NVM at all, understand what the qualification message
+actually means. i40e prints it from:
+
+```c
+if ((status->link_info & I40E_AQ_MEDIA_AVAILABLE) &&
+    (!(status->an_info & I40E_AQ_QUALIFIED_MODULE)) &&
+    (!(status->link_info & I40E_AQ_LINK_UP)) && ...)
+        dev_err(... "unsupported SFP module type was detected");
+```
+
+So it fires whenever a module is **present**, **not in Intel's list**, and the
+link is **down for any reason**. A third-party module satisfies the first two
+permanently — including on a card with qualification disabled. The message is
+therefore a *consequence* of having no link, not proof that qualification is
+what prevents it. The driver only prints; it never disables anything itself.
+
+The symptom that does discriminate is `ethtool` reporting
+`Supported link modes: Not reported`. That means `hw->phy.phy_types == 0`, and
+i40e only populates it when `i40e_aq_get_phy_capabilities()` succeeds — so the
+firmware is failing to report PHY capabilities at all, which is what happens
+when it cannot determine a PHY type for the module. A card merely declining to
+whitelist a module still knows and reports its own abilities.
+
+Run `ethtool -m <iface>` early. If the card cannot read the module's SFF-8636
+EEPROM, or the module declares a compliance code outside the XL710's
+`40GBASE-CR4/SR4/LR4/AOC/XLPPI`, no NVM bit will help.
+
 ## If it says "unlocked" but the card still rejects modules
 
 Check these in order before touching anything:
@@ -196,8 +225,16 @@ Its NVM checksum validated and `phy_type` already permitted `40GBASE_CR4`, so
 the module was not being refused on type or speed. Clearing bit 11 — all this
 tool or any other can do — was already done and had not helped.
 
-**The fix in that situation is to flash Intel's open-optics build, not to patch
-bits.** `nvmupdate64e` selects an image by matching the card's current EETRACK
+**To get such a card back to a state some firmware actually ships, flash
+Intel's open-optics build rather than patching bits.** That is worth doing on
+its own merits — it repaired the stale `+0x01` and put the card on a real
+`EEPID` — but be clear about what it did *not* do: on the card above it did not
+make the third-party DAC link. Bit 11, the build lineage and the whole NVM were
+exonerated, and the fault lay elsewhere (see the next section). Treat the flash
+as a way to eliminate the NVM as a variable, not as a cure for a rejected
+module.
+
+`nvmupdate64e` selects an image by matching the card's current EETRACK
 against a block's `REPLACES` list, and a card already at `8001037B` is the
 locked build's own `EEPID`, so the tool considers it up to date and will not
 cross over to the OO lineage. The two `nvmupdate.cfg` blocks are otherwise
