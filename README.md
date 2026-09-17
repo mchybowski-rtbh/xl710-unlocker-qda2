@@ -337,6 +337,67 @@ verbatim from what the firmware reports, so anything absent there stays absent:
 - `ENABLE_AN 0x10` is added by `i40e_set_link_ksettings()` when autoneg is
   enabled, which makes `ethtool -s <iface> autoneg on` a genuine lever.
 
+### The out-of-tree driver fights itself, and `link-down-on-close` stops it
+
+Intel's out-of-tree i40e has a code path mainline lacks. In
+`i40e_handle_link_event()`, for an unqualified module with the link down:
+
+```c
+err = i40e_restore_supported_phy_link_speed(pf);
+if (err) {
+        dev_err(... "unsupported SFP+ module type was detected");
+        return;
+}
+dev_info(... "The selected speed is incompatible with the connected media type. "
+             "Resetting to the default speed setting for the media type.");
+```
+
+So the two messages are the *same* branch: the SFP error means that call
+failed, and the speed message means it succeeded. Seeing the speed message
+several times a second is therefore progress, not a new fault.
+
+But look at what succeeding does:
+
+```c
+i40e_aq_get_phy_capabilities(hw, false, false, &abilities, NULL);  /* current */
+config.phy_type = abilities.phy_type;          /* == 0 for an unusable module */
+config.abilities |= I40E_AQ_PHY_ENABLE_AN;
+i40e_aq_get_phy_capabilities(hw, false, true, &abilities, NULL);   /* initial */
+config.link_speed = abilities.link_speed;      /* the NVM's 40G */
+i40e_aq_set_phy_config(hw, &config, NULL);
+```
+
+It writes `phy_type = 0` together with `link_speed = 40G` — which is exactly
+the inconsistency the firmware then complains about. Worse, it **clobbers the
+full PHY-type mask** that `i40e_open()` had just forced, on every link event.
+The driver forces `I40E_PHY_TYPES_BITMASK` (including `PHY_TYPE_UNRECOGNIZED`
+and `PHY_TYPE_UNSUPPORTED`) at open, and the link-event handler immediately
+undoes it, several times a second.
+
+The whole restore block is gated on:
+
+```c
+(!(pf->flags & I40E_FLAG_LINK_DOWN_ON_CLOSE_ENABLED))
+```
+
+so enabling that priv flag skips the clobber, while `i40e_open()` (called
+unconditionally) and `i40e_up()` (called when this very flag is set) still
+force the full mask:
+
+```shell
+sudo ethtool --set-priv-flags <iface> link-down-on-close on
+sudo ip link set <iface> down && sudo ip link set <iface> up
+ethtool <iface> | grep -iE 'link|speed'
+```
+
+The early return in `i40e_force_link_state()` — `is_up && abilities.phy_type
+!= 0 && abilities.link_speed != 0` — does not trigger for a card reporting
+`phy_type == 0`, so the mask really is written.
+
+**Caveat:** that flag also suppresses both messages. A quiet log is not
+success; only carrier and speed are. Verify with `ethtool`/`ip link`, not by
+the absence of log spam.
+
 ### An unresolved ambiguity about bit 11
 
 Those bit values raise a question this project cannot yet answer. If Misc0's
