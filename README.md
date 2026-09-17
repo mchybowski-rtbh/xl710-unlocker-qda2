@@ -474,12 +474,24 @@ verified spent:
 - `link-down-on-close on`, so the link-event handler no longer clobbers that
 - no module parameter, priv flag, or AQ bit exists that disables qualification
 
-The firmware still reported `phy_type == 0` and never trained. At that point
-the remaining explanations are physical — the cable, the cage, or the board —
-and the next test is not another bit but a different peer: connect the port to
-a **switch** rather than looping it back to the card's own other port. Two
-ports of one card driven by one EMP is not a configuration any of this was
-validated against, and a fault there is not evidence about the cable.
+The firmware still reported `phy_type == 0` and never trained — against the
+card's own other port *and* against an Arista switch in 40G mode with no
+breakout. Controller register, EEPROM and interrupt self-tests passed on both
+ports.
+
+So the card is healthy, the NVM is Intel's own open-optics build, the driver is
+forcing every PHY type there is, and the switch reads the cable as
+`40GBASE-CR4` — yet this controller will not classify that module. The
+remaining explanation is module interpretation: the EMP either cannot read the
+module's SFF-8636 EEPROM over the board's I2C, or reads it and rejects
+something in it that a switch tolerates. Both are outside anything an NVM bit
+reaches.
+
+The test that discriminates is **a different module**, not another bit: a
+genuine Intel-coded DAC, or a 40G SR4 optical pair instead of copper. Note that
+two cables of the same make and firmware are one data point, not two. The one
+reported success on this card model (upstream issue #6) came from recoding the
+QSFP+ module's own EEPROM to Intel data, with no card changes at all.
 
 ## Notes
 
