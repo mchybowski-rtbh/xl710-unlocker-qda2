@@ -431,6 +431,35 @@ the `abilities` byte. A missing `0x08` in the NVM cannot be what keeps a port
 down. Combined with Intel shipping `OEMGEN` and `OEMGEN_OO` differing in
 exactly bit 11, the qualification reading stands.
 
+### `ethtool -t` reports FAIL on any port with no carrier
+
+Do not read an overall FAIL as a hardware verdict. i40e's "link test" is not a
+test of anything:
+
+```c
+status = i40e_get_link_status(&pf->hw, &link_up);
+...
+if (link_up) *data = 0; else *data = 1;
+```
+
+It asks whether the link is up and fails if it is not, so on a port that is
+already down it must report 1 and drag the whole result to FAIL. The sub-tests
+that actually exercise hardware are the other three:
+
+```
+Register test  (offline)     0     <- controller registers OK
+Eeprom test    (offline)     0     <- NVM readable, checksum OK
+Interrupt test (offline)     0     <- MSI-X delivery OK
+Link test   (on/offline)     1     <- "is the link up?" - no
+```
+
+Those three passing on both ports of the card traced through this README is
+evidence the controller is *healthy*, and argues against the counterfeit- or
+dead-board theories that are otherwise tempting at this point. Note also that
+both ports failing identically points to a shared cause — one EMP, one NVM, one
+board configuration, and in that case a same-card loopback as the only peer
+ever tried — rather than to symmetric hardware damage.
+
 ### When the software avenues are exhausted
 
 On the XL710-QDA2 traced through this README, every software lever was
