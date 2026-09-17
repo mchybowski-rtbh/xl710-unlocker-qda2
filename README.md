@@ -141,6 +141,48 @@ Check these in order before touching anything:
    refreshing the checksum leaves an image the EMP may reject wholesale. This
    tool always refreshes it after a write.
 
+## Known limitation: firmware 9.57 on XL710-QDA2
+
+On at least one XL710-QDA2 (`0x1583`, firmware **9.57**, EETRACK `0x8001037b`)
+this method does not work, because there is nothing left to patch:
+
+```
+PHY capabilities at 0x69c4: 4 struct(s), size 0x0d, stride 0x0e
+  port 0..3  Misc0 = 0x0310   <- bit 11 already CLEAR from the factory
+  phy_type 0x07000600: XLPPI 40GBASE_CR4_CU 40GBASE_CR4 40GBASE_SR4 40GBASE_LR4
+  link_speed 0x10: 40G
+```
+
+The card nevertheless refuses a third-party 40G QSFP+ DAC with the
+qualification message, and `ethtool` reports `Supported link modes: Not
+reported` (i.e. `i40e_aq_get_phy_abilities()` returned nothing, so the EMP is
+shutting the PHY down rather than the driver refusing it).
+
+What was checked on that image, all negative:
+
+- the section is certain — the EMP pointer table at `emp+0x19..0x1c` holds four
+  per-port pointers landing exactly on the four structs
+- NVM checksum validates (computed `0xb415` == stored), so it is not a
+  half-applied patch the EMP is ignoring
+- `phy_type` already permits `40GBASE_CR4`, so the module is not being refused
+  on PHY type or speed
+- no second qualification-shaped word anywhere in the 64 KB Shadow RAM: no
+  other section matching the repeating-size signature, and no value with bit 11
+  set repeating at any stride 4..64 in `0x6000-0x7800`
+- no qualified-module list in the Shadow RAM (only VPD strings), so it lives in
+  the EMP blob outside this window
+
+Conclusion: on that firmware the enforcement is not reachable from the Shadow
+RAM PHY capabilities section, and clearing bit 11 — which every tool including
+this one does — is a no-op because it is already clear. Reports of success on
+firmware 9.3 and 9.10 are on cards where bit 11 was still *set*.
+
+If you are in this position, the options that don't involve guessing at flash
+writes are: recode the module's own EEPROM to an Intel-qualified vendor OUI and
+part number (upstream issue #6 is an XL710-QDA2 resolved exactly this way, with
+no card changes), use an Intel-coded module, or downgrade the firmware to a
+revision where bit 11 is set and honoured.
+
 ## Notes
 
 - The NVM is shared by all ports; patch one interface, not each in turn.
